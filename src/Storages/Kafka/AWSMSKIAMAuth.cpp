@@ -54,48 +54,48 @@ namespace
 {
     constexpr std::chrono::seconds TOKEN_LIFETIME{300};
     constexpr std::chrono::seconds PRESIGNED_URL_EXPIRY{900};
+}
 
-    String generateAWSMSKToken(
-        const String & region,
-        const Aws::Auth::AWSCredentials & credentials)
+String generateAWSMSKToken(
+    const String & region,
+    const Aws::Auth::AWSCredentials & credentials)
+{
+    try
     {
-        try
+        String service_host = "kafka." + region + ".amazonaws.com";
+
+        Aws::Http::URI uri;
+        uri.SetScheme(Aws::Http::Scheme::HTTPS);
+        uri.SetAuthority(service_host);
+        uri.SetPath("/");
+        uri.AddQueryStringParameter("Action", "kafka-cluster:Connect");
+
+        auto request = Aws::Http::CreateHttpRequest(
+            uri,
+            Aws::Http::HttpMethod::HTTP_GET,
+            Aws::Utils::Stream::DefaultResponseStreamFactoryMethod);
+
+        Aws::Client::AWSAuthV4Signer signer(
+            std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(credentials),
+            "kafka-cluster",
+            region,
+            Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+            true);
+
+        if (!signer.PresignRequest(*request, PRESIGNED_URL_EXPIRY.count()))
         {
-            String service_host = "kafka." + region + ".amazonaws.com";
-
-            Aws::Http::URI uri;
-            uri.SetScheme(Aws::Http::Scheme::HTTPS);
-            uri.SetAuthority(service_host);
-            uri.SetPath("/");
-            uri.AddQueryStringParameter("Action", "kafka-cluster:Connect");
-
-            auto request = Aws::Http::CreateHttpRequest(
-                uri,
-                Aws::Http::HttpMethod::HTTP_GET,
-                Aws::Utils::Stream::DefaultResponseStreamFactoryMethod);
-
-            Aws::Client::AWSAuthV4Signer signer(
-                std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(credentials),
-                "kafka-cluster",
-                region,
-                Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
-                true);
-
-            if (!signer.PresignRequest(*request, PRESIGNED_URL_EXPIRY.count()))
-            {
-                throw Exception(ErrorCodes::AWS_ERROR, "Failed to presign AWS MSK IAM request");
-            }
-
-            String presigned_url = request->GetURIString();
-
-            presigned_url += "&User-Agent=clickhouse-msk-iam";
-
-            return base64Encode(presigned_url, /* url_encoding */ true, /* no_padding */ true);
+            throw Exception(ErrorCodes::AWS_ERROR, "Failed to presign AWS MSK IAM request");
         }
-        catch (const std::exception & e)
-        {
-            throw Exception(ErrorCodes::AWS_ERROR, "Failed to generate AWS MSK token: {}", e.what());
-        }
+
+        String presigned_url = request->GetURIString();
+
+        presigned_url += "&User-Agent=clickhouse-msk-iam";
+
+        return base64Encode(presigned_url, /* url_encoding */ true, /* no_padding */ true);
+    }
+    catch (const std::exception & e)
+    {
+        throw Exception(ErrorCodes::AWS_ERROR, "Failed to generate AWS MSK token: {}", e.what());
     }
 }
 

@@ -5,9 +5,18 @@
 
 #include <Storages/Kafka/AWSMSKIAMAuth.h>
 #include <Common/Exception.h>
+#include <Common/Base64.h>
+#include <Common/OpenSSLHelpers.h>
+#include <Common/re2.h>
+#include <IO/S3/Client.h>
 #include <Poco/Util/MapConfiguration.h>
 #include <cppkafka/configuration.h>
 #include <cppkafka/kafka_handle_base.h>
+#include <aws/core/auth/AWSCredentials.h>
+
+#include <algorithm>
+#include <map>
+#include <vector>
 
 namespace DB
 {
@@ -239,6 +248,186 @@ TEST(AWSMSKIAMAuth, SetupAutoDetectsRegionFromBrokerList)
     {
         // Ok: non-BAD_ARGUMENTS exceptions (e.g. missing AWS credentials) are acceptable here.
     }
+}
+
+// ---------------------------------------------------------------------------
+// generateAWSMSKToken: token structure + independent SigV4 signature check.
+//
+// The MSK IAM token is a base64url-encoded (no padding) SigV4-presigned URL for
+// `Action=kafka-cluster:Connect` against `kafka.<region>.amazonaws.com`, signed
+// for service `kafka-cluster`. These tests decode the token, assert its
+// structure, and independently recompute the SigV4 signature WITHOUT going
+// through the AWS SDK signer (a separate implementation using ClickHouse's
+// SHA-256/HMAC helpers), proving the signed material is byte-correct.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// Static, non-functional credentials, used only for deterministic signing in tests.
+const char * const TEST_ACCESS_KEY = "AKIDEXAMPLE";
+const char * const TEST_SECRET_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+const char * const TEST_SESSION_TOKEN = "FQoEXAMPLEsessiontoken";
+
+/// Ensure the AWS SDK (crypto factories used by the signer) is initialised.
+void ensureAwsInitialised()
+{
+    DB::S3::ClientFactory::instance();
+}
+
+std::string decodeToken(const std::string & token)
+{
+    return base64Decode(token, /* url_encoding */ true, /* no_padding */ true);
+}
+
+/// Parse the query part of a URL into key -> (percent-encoded) value.
+std::map<std::string, std::string> parseQuery(const std::string & url)
+{
+    std::map<std::string, std::string> params;
+    auto qpos = url.find('?');
+    if (qpos == std::string::npos)
+        return params;
+    const std::string query = url.substr(qpos + 1);
+    size_t start = 0;
+    while (start < query.size())
+    {
+        size_t amp = query.find('&', start);
+        std::string pair = query.substr(start, amp == std::string::npos ? std::string::npos : amp - start);
+        auto eq = pair.find('=');
+        if (eq != std::string::npos)
+            params[pair.substr(0, eq)] = pair.substr(eq + 1);
+        else
+            params[pair] = "";
+        if (amp == std::string::npos)
+            break;
+        start = amp + 1;
+    }
+    return params;
+}
+
+std::string toHex(const std::vector<uint8_t> & data)
+{
+    static const char * digits = "0123456789abcdef";
+    std::string out;
+    out.reserve(data.size() * 2);
+    for (uint8_t b : data)
+    {
+        out.push_back(digits[b >> 4]);
+        out.push_back(digits[b & 0x0F]);
+    }
+    return out;
+}
+
+std::string sha256Hex(const std::string & data)
+{
+    const std::string digest = encodeSHA256(data);
+    return toHex(std::vector<uint8_t>(digest.begin(), digest.end()));
+}
+
+std::vector<uint8_t> bytes(const std::string & s)
+{
+    return std::vector<uint8_t>(s.begin(), s.end());
+}
+
+/// Independently recompute the SigV4 signature for the presigned MSK URL, reusing the
+/// X-Amz-Date the SDK embedded so the check is deterministic without freezing the clock.
+std::string recomputeSignature(const std::string & url, const std::string & region, const std::string & secret_key)
+{
+    const std::string host = "kafka." + region + ".amazonaws.com";
+    const auto params = parseQuery(url);
+
+    /// Canonical query: all signed params sorted, excluding the signature itself and
+    /// the unsigned `User-Agent` suffix appended after signing. Values are taken verbatim
+    /// (already percent-encoded), so they match exactly what the SDK signed.
+    std::vector<std::string> pairs;
+    for (const auto & [k, v] : params)
+    {
+        if (k == "X-Amz-Signature" || k == "User-Agent")
+            continue;
+        pairs.push_back(k + "=" + v);
+    }
+    std::sort(pairs.begin(), pairs.end());
+    std::string canonical_query;
+    for (size_t i = 0; i < pairs.size(); ++i)
+        canonical_query += (i ? "&" : "") + pairs[i];
+
+    /// `kafka-cluster` is not S3, so the canonical payload hash is the empty-string SHA-256.
+    const std::string empty_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const std::string canonical_request
+        = "GET\n/\n" + canonical_query + "\n" + "host:" + host + "\n" + "\n" + "host\n" + empty_sha256;
+
+    const std::string amz_date = params.at("X-Amz-Date");   // e.g. 20260624T120000Z
+    const std::string simple_date = amz_date.substr(0, 8);  // 20260624
+    const std::string scope = simple_date + "/" + region + "/kafka-cluster/aws4_request";
+    const std::string string_to_sign = "AWS4-HMAC-SHA256\n" + amz_date + "\n" + scope + "\n" + sha256Hex(canonical_request);
+
+    auto k_date = hmacSHA256(bytes("AWS4" + secret_key), simple_date);
+    auto k_region = hmacSHA256(k_date, region);
+    auto k_service = hmacSHA256(k_region, "kafka-cluster");
+    auto k_signing = hmacSHA256(k_service, "aws4_request");
+    return toHex(hmacSHA256(k_signing, string_to_sign));
+}
+
+}
+
+TEST(AWSMSKIAMAuthToken, TokenStructure)
+{
+    ensureAwsInitialised();
+    const std::string token = generateAWSMSKToken("us-east-1", Aws::Auth::AWSCredentials{TEST_ACCESS_KEY, TEST_SECRET_KEY, TEST_SESSION_TOKEN});
+
+    // base64url alphabet, no padding.
+    EXPECT_EQ(token.find('='), std::string::npos);
+    EXPECT_EQ(token.find('+'), std::string::npos);
+    EXPECT_EQ(token.find('/'), std::string::npos);
+
+    const std::string url = decodeToken(token);
+    EXPECT_EQ(url.rfind("https://kafka.us-east-1.amazonaws.com/?", 0), 0u);
+    EXPECT_NE(url.find("Action=kafka-cluster%3AConnect"), std::string::npos);
+    EXPECT_NE(url.find("&User-Agent=clickhouse-msk-iam"), std::string::npos);
+
+    const auto params = parseQuery(url);
+    EXPECT_EQ(params.at("X-Amz-Algorithm"), "AWS4-HMAC-SHA256");
+    EXPECT_EQ(params.at("X-Amz-Expires"), "900");
+    EXPECT_EQ(params.at("X-Amz-SignedHeaders"), "host");
+    EXPECT_NE(params.find("X-Amz-Security-Token"), params.end());   // session token present
+
+    // Credential scope embeds access key, region and service.
+    EXPECT_NE(params.at("X-Amz-Credential").find(TEST_ACCESS_KEY), std::string::npos);
+    EXPECT_NE(params.at("X-Amz-Credential").find("us-east-1"), std::string::npos);
+    EXPECT_NE(params.at("X-Amz-Credential").find("kafka-cluster"), std::string::npos);
+
+    static const RE2 date_re(R"(^\d{8}T\d{6}Z$)");
+    EXPECT_TRUE(RE2::FullMatch(params.at("X-Amz-Date"), date_re));
+    static const RE2 sig_re("^[0-9a-f]{64}$");
+    EXPECT_TRUE(RE2::FullMatch(params.at("X-Amz-Signature"), sig_re));
+}
+
+TEST(AWSMSKIAMAuthToken, SignatureMatchesIndependentRecomputation)
+{
+    ensureAwsInitialised();
+    const std::string url = decodeToken(generateAWSMSKToken("us-east-1", Aws::Auth::AWSCredentials{TEST_ACCESS_KEY, TEST_SECRET_KEY, TEST_SESSION_TOKEN}));
+    const auto params = parseQuery(url);
+    EXPECT_EQ(recomputeSignature(url, "us-east-1", TEST_SECRET_KEY), params.at("X-Amz-Signature"));
+}
+
+TEST(AWSMSKIAMAuthToken, RegionPropagatesToHostScopeAndSignature)
+{
+    ensureAwsInitialised();
+    const std::string url = decodeToken(generateAWSMSKToken("eu-west-2", Aws::Auth::AWSCredentials{TEST_ACCESS_KEY, TEST_SECRET_KEY, TEST_SESSION_TOKEN}));
+    EXPECT_EQ(url.rfind("https://kafka.eu-west-2.amazonaws.com/?", 0), 0u);
+    const auto params = parseQuery(url);
+    EXPECT_NE(params.at("X-Amz-Credential").find("eu-west-2"), std::string::npos);
+    EXPECT_EQ(recomputeSignature(url, "eu-west-2", TEST_SECRET_KEY), params.at("X-Amz-Signature"));
+}
+
+TEST(AWSMSKIAMAuthToken, NoSessionTokenOmitsSecurityToken)
+{
+    ensureAwsInitialised();
+    // Credentials without a session token (e.g. long-lived IAM user keys).
+    const std::string url = decodeToken(generateAWSMSKToken("us-east-1", Aws::Auth::AWSCredentials{TEST_ACCESS_KEY, TEST_SECRET_KEY}));
+    const auto params = parseQuery(url);
+    EXPECT_EQ(params.find("X-Amz-Security-Token"), params.end());
+    EXPECT_EQ(recomputeSignature(url, "us-east-1", TEST_SECRET_KEY), params.at("X-Amz-Signature"));
 }
 
 #endif // USE_AWS_S3

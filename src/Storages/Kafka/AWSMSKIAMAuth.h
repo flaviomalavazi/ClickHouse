@@ -8,6 +8,7 @@
 #include <Common/Logger.h>
 #include <cppkafka/configuration.h>
 #include <Poco/Util/AbstractConfiguration.h>
+#include <aws/core/auth/AWSCredentials.h>
 
 namespace DB::S3 { class S3CredentialsProviderChain; }
 
@@ -27,6 +28,11 @@ String extractRegionFromBroker(const String & broker_address);
 
 /// Returns true if region looks like a valid AWS region (e.g. us-east-1, us-gov-west-1).
 bool isValidAWSRegion(const String & region);
+
+/// Generate an AWS MSK IAM OAUTHBEARER token from the given credentials: a base64url-encoded
+/// (no padding) SigV4-presigned URL for `Action=kafka-cluster:Connect` against
+/// `kafka.<region>.amazonaws.com`, signed for service `kafka-cluster`. Exposed for testing.
+String generateAWSMSKToken(const String & region, const Aws::Auth::AWSCredentials & credentials);
 
 /// Setup AWS MSK IAM authentication for Kafka
 /// This configures librdkafka to use OAUTHBEARER with a callback
